@@ -2,6 +2,7 @@ from datetime import datetime
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 import uuid
+import random
 
 
 default_args = {
@@ -10,36 +11,41 @@ default_args = {
 }
 
 
-def get_data():
-    import requests
+FIRST_NAMES = ['James', 'Emma', 'Oliver', 'Sophia', 'Liam', 'Ava', 'Noah', 'Isabella',
+               'William', 'Mia', 'Benjamin', 'Charlotte', 'Elijah', 'Amelia', 'Lucas']
+LAST_NAMES = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller',
+              'Davis', 'Wilson', 'Taylor', 'Anderson', 'Thomas', 'Jackson', 'White']
+CITIES = ['London', 'Manchester', 'Birmingham', 'Leeds', 'Glasgow', 'Liverpool',
+          'Bristol', 'Sheffield', 'Edinburgh', 'Cardiff']
+COUNTRIES = ['United Kingdom']
+GENDERS = ['male', 'female']
+STREETS = ['High Street', 'Church Lane', 'Victoria Road', 'Kings Avenue', 'Queens Drive',
+           'Park Street', 'Station Road', 'Mill Lane', 'Brook Way', 'Hill Road']
 
-    res = requests.get("https://randomuser.me/api/")
-    res = res.json()
-    results = res.get('results', [])
-    if not results:
-        raise ValueError("Empty results from randomuser.me API")
-    return results[0]
 
+def generate_data():
+    first = random.choice(FIRST_NAMES)
+    last = random.choice(LAST_NAMES)
+    gender = random.choice(GENDERS)
+    city = random.choice(CITIES)
+    street_num = random.randint(1, 999)
+    street = random.choice(STREETS)
+    postcode = f"{random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ')}{random.randint(1,9)} {random.randint(1,9)}{random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ')}{random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ')}"
 
-def format_data(res):
-    data = {}
-    location = res['location']
-    data['id'] = str(uuid.uuid4())
-    data['first_name'] = res['name']['first']
-    data['last_name'] = res['name']['last']
-    data['gender'] = res['gender']
-    data['address'] = (
-        f"{str(location['street']['number'])} {location['street']['name']}, "
-        f"{location['city']}, {location['state']}, {location['country']}"
-    )
-    data['post_code'] = location['postcode']
-    data['email'] = res['email']
-    data['username'] = res['login']['username']
-    data['dob'] = res['dob']['date']
-    data['registered_date'] = res['registered']['date']
-    data['phone'] = res['phone']
-    data['picture'] = res['picture']['medium']
-    return data
+    return {
+        'id': str(uuid.uuid4()),
+        'first_name': first,
+        'last_name': last,
+        'gender': gender,
+        'address': f"{street_num} {street}, {city}, England, United Kingdom",
+        'post_code': postcode,
+        'email': f"{first.lower()}.{last.lower()}{random.randint(1,999)}@example.com",
+        'username': f"{first.lower()}{last.lower()}{random.randint(1,9999)}",
+        'dob': f"{random.randint(1950,2000)}-{random.randint(1,12):02d}-{random.randint(1,28):02d}T00:00:00.000Z",
+        'registered_date': f"{random.randint(2010,2024)}-{random.randint(1,12):02d}-{random.randint(1,28):02d}T00:00:00.000Z",
+        'phone': f"07{random.randint(100000000,999999999)}",
+        'picture': f"https://randomuser.me/api/portraits/med/{'men' if gender == 'male' else 'women'}/{random.randint(1,99)}.jpg"
+    }
 
 
 def stream_data():
@@ -48,19 +54,31 @@ def stream_data():
     import time
     import logging
 
-    producer = KafkaProducer(bootstrap_servers=['broker:29092'], max_block_ms=5000)
+    producer = KafkaProducer(
+        bootstrap_servers=['broker:29092'],
+        max_block_ms=5000,
+        batch_size=65536,        # 64KB batch — sends more messages per request
+        linger_ms=10,            # wait 10ms to fill batch before sending
+        compression_type='gzip'  # compress batches
+    )
+
     curr_time = time.time()
+    count = 0
 
     while True:
         if time.time() > curr_time + 60:
             break
         try:
-            res = get_data()
-            res = format_data(res)
-            producer.send('users_created', json.dumps(res).encode('utf-8'))
+            data = generate_data()
+            producer.send('users_created', json.dumps(data).encode('utf-8'))
+            count += 1
         except Exception as e:
             logging.error(f'An error occurred: {e}')
             continue
+
+    producer.flush()
+    logging.info(f'Stream complete. Total messages sent: {count}')
+    print(f'Total messages sent: {count}')
 
 
 with DAG('user_automation',
@@ -72,5 +90,3 @@ with DAG('user_automation',
         task_id='stream_data_from_api',
         python_callable=stream_data
     )
-
-#

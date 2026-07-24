@@ -50,25 +50,25 @@ services:
     networks:
       - confluent
     healthcheck:
-      test: [ "CMD", "bash", "-c", 'nc -z localhost 9092' ]
+      test: ["CMD", "bash", "-c", 'nc -z localhost 9092']
       interval: 10s
       timeout: 5s
       retries: 5
 
   kafka-init:
-  image: confluentinc/cp-server:7.4.0
-  depends_on:
-    broker:
-      condition: service_healthy
-  entrypoint: ['/bin/sh', '-c']
-  command: |
-    "kafka-topics --create --if-not-exists \
-      --bootstrap-server broker:29092 \
-      --replication-factor 1 \
-      --partitions 1 \
-      --topic users_created"
-  networks:
-    - confluent
+    image: confluentinc/cp-server:7.4.0
+    depends_on:
+      broker:
+        condition: service_healthy
+    entrypoint: ['/bin/sh', '-c']
+    command: |
+      kafka-topics --create --if-not-exists \
+        --bootstrap-server broker:29092 \
+        --replication-factor 1 \
+        --partitions 1 \
+        --topic users_created
+    networks:
+      - confluent
 
   schema-registry:
     image: confluentinc/cp-schema-registry:7.4.0
@@ -86,7 +86,7 @@ services:
     networks:
       - confluent
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8081/" ]
+      test: ["CMD", "curl", "-f", "http://localhost:8081/"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -114,7 +114,7 @@ services:
     networks:
       - confluent
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:9021/health" ]
+      test: ["CMD", "curl", "-f", "http://localhost:9021/health"]
       interval: 30s
       timeout: 10s
       retries: 5

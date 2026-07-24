@@ -65,13 +65,16 @@ def insert_data(session, **kwargs):
 
 def create_spark_connection():
     s_conn = None
-
     try:
         s_conn = SparkSession.builder \
             .appName('SparkDataStreaming') \
-            .config('spark.jars.packages', "com.datastax.spark:spark-cassandra-connector_2.12:3.5.0,"
-                                           "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
-            .config('spark.cassandra.connection.host', 'localhost') \
+            .config('spark.jars.packages',
+                    "com.datastax.spark:spark-cassandra-connector_2.12:3.5.0,"
+                    "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
+            .config('spark.cassandra.connection.host', '127.0.0.1') \
+            .config('spark.cassandra.connection.port', '9042') \
+            .config('spark.cassandra.auth.username', 'cassandra') \
+            .config('spark.cassandra.auth.password', 'cassandra') \
             .getOrCreate()
 
         s_conn.sparkContext.setLogLevel("ERROR")
