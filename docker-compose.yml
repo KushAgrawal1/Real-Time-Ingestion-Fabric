@@ -55,6 +55,21 @@ services:
       timeout: 5s
       retries: 5
 
+  kafka-init:
+  image: confluentinc/cp-server:7.4.0
+  depends_on:
+    broker:
+      condition: service_healthy
+  entrypoint: ['/bin/sh', '-c']
+  command: |
+    "kafka-topics --create --if-not-exists \
+      --bootstrap-server broker:29092 \
+      --replication-factor 1 \
+      --partitions 1 \
+      --topic users_created"
+  networks:
+    - confluent
+
   schema-registry:
     image: confluentinc/cp-schema-registry:7.4.0
     hostname: schema-registry
