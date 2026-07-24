@@ -42,7 +42,7 @@ def stream_data():
     import json
     res = get_data()
     res = format_data(res)
-    print(json.dumps(res, indent=3))
+    # print(json.dumps(res, indent=3))
 
 
     
