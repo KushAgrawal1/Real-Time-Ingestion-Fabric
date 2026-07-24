@@ -1,16 +1,27 @@
 # Real-Time Ingestion Fabric
 
-An end-to-end real-time data engineering pipeline that streams randomly generated user data from a public API through Kafka, processes it with Spark Structured Streaming, and persists it to Cassandra — fully orchestrated with Apache Airflow and containerised with Docker.
+An end-to-end real-time data engineering pipeline that generates synthetic user events, streams them through Kafka at 10,000+ events/sec, processes them with Spark Structured Streaming, and persists them to Cassandra — fully orchestrated with Apache Airflow and containerised with Docker.
+
+---
+
+## Performance
+
+| Metric | Result |
+|---|---|
+| Total events produced | 850,975 |
+| Total rows written to Cassandra | 850,117 |
+| Message delivery rate | 99.9% |
+| Producer throughput | 10,000+ events/sec |
+| DAG runs | 10 successful runs |
+| Mean DAG run duration | 1 min 18 sec |
+| Services on single Docker network | 7 |
 
 ---
 
 ## Architecture
 
 ```
-randomuser.me API
-       │
-       ▼
- Apache Airflow          ← orchestrates & schedules the producer DAG
+Synthetic Data Generator (Airflow DAG)
        │
        ▼
  Apache Kafka            ← message broker (topic: users_created)
@@ -32,7 +43,7 @@ All services run on a shared Docker network (`confluent`), with Confluent Contro
 |---|---|
 | Orchestration | Apache Airflow 2.6.0 |
 | Message Broker | Apache Kafka (Confluent 7.4.0) |
-| Stream Processing | Apache Spark 3.5.0 (PySpark) |
+| Stream Processing | Apache Spark 3.5.3 (PySpark) |
 | Storage | Apache Cassandra 5.0 |
 | Monitoring | Confluent Control Center |
 | Schema Management | Confluent Schema Registry |
@@ -45,18 +56,22 @@ All services run on a shared Docker network (`confluent`), with Confluent Contro
 
 ### 1. Ingestion (Airflow DAG)
 - `kafka_stream.py` defines a DAG (`user_automation`) scheduled to run daily
-- On trigger, it calls the [randomuser.me](https://randomuser.me) API every second for 60 seconds
-- Each response is formatted and published to the Kafka topic `users_created` as a JSON message
+- On trigger, a synthetic data generator produces realistic user records (names, addresses, emails, phone numbers) at maximum throughput — no API rate limits
+- Each record is serialised as JSON and published to the Kafka topic `users_created`
+- Producer is configured with `batch_size=65536`, `linger_ms=10`, and `gzip` compression for high throughput
+- Each DAG run streams for 60 seconds, producing ~85,000 events per run
 
 ### 2. Processing (Spark Structured Streaming)
 - `spark_stream.py` reads from the `users_created` Kafka topic using Spark's `readStream`
 - Deserialises the JSON payload against a defined schema
 - Writes each micro-batch to Cassandra via the Spark-Cassandra connector
+- Checkpoint location `/tmp/checkpoint` ensures exactly-once processing semantics
 
 ### 3. Storage (Cassandra)
 - Keyspace: `spark_streams`
 - Table: `created_users`
 - Primary key: `id` (UUID)
+- SSTable compression ratio: 0.63 (Cassandra compressed data to 63% of original size)
 
 ---
 
@@ -65,7 +80,7 @@ All services run on a shared Docker network (`confluent`), with Confluent Contro
 ```
 .
 ├── dags/
-│   └── kafka_stream.py          # Airflow DAG — API ingestion + Kafka producer
+│   └── kafka_stream.py          # Airflow DAG — synthetic data generator + Kafka producer
 ├── spark_stream.py              # Spark Structured Streaming consumer → Cassandra
 ├── docker-compose.yml           # Full stack: Zookeeper, Kafka, Spark, Airflow, Cassandra
 ├── script/
@@ -85,8 +100,8 @@ All services run on a shared Docker network (`confluent`), with Confluent Contro
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/KushAgrawal1/real-time-ingestion-fabric.git
-cd real-time-ingestion-fabric
+git clone https://github.com/KushAgrawal1/Real-Time-Ingestion-Fabric.git
+cd Real-Time-Ingestion-Fabric
 ```
 
 ### 2. Start all services
@@ -106,7 +121,7 @@ This starts:
 
 ### 3. Trigger the Airflow DAG
 
-Open `http://localhost:8080` (user: `admin`, password: `admin`), find the `user_automation` DAG and trigger it manually. This starts publishing messages to the `users_created` Kafka topic.
+Open `http://localhost:8080` (user: `admin`, password: `admin`), find the `user_automation` DAG and trigger it manually. This starts the synthetic data generator and publishes messages to the `users_created` Kafka topic.
 
 ### 4. Run the Spark consumer
 
@@ -125,6 +140,7 @@ docker exec -it cassandra cqlsh -u cassandra -p cassandra
 
 ```sql
 SELECT * FROM spark_streams.created_users LIMIT 10;
+SELECT COUNT(*) FROM spark_streams.created_users;
 ```
 
 ---
@@ -141,6 +157,14 @@ docker exec -it broker kafka-console-consumer \
   --max-messages 5
 ```
 
+To check total messages produced:
+
+```bash
+docker exec -it broker kafka-run-class kafka.tools.GetOffsetShell \
+  --broker-list localhost:9092 \
+  --topic users_created
+```
+
 ---
 
 ## Monitoring
@@ -148,6 +172,7 @@ docker exec -it broker kafka-console-consumer \
 - **Confluent Control Center**: `http://localhost:9021` — view topics, consumer groups, and message throughput
 - **Airflow UI**: `http://localhost:8080` — monitor DAG runs and task logs
 - **Spark Master UI**: `http://localhost:9090` — view active streaming jobs
+- **Spark Streaming UI**: `http://localhost:4040` — view micro-batch stats and processing time
 
 ---
 
@@ -156,7 +181,8 @@ docker exec -it broker kafka-console-consumer \
 - `spark_stream.py` runs on the host machine (not inside Docker), so it connects to services via `localhost` ports
 - The Airflow DAG runs inside Docker, so it connects to Kafka via `broker:29092` (internal Docker network)
 - Checkpoints are stored at `/tmp/checkpoint` — delete this folder if restarting from scratch
-- The Kafka topic `users_created` is auto-created on first message; to pre-create it manually run:
+- Cassandra requires at least 256MB heap — configured via `MAX_HEAP_SIZE` in docker-compose.yml
+- For high-volume runs (850K+ events), allow Cassandra 3-4 minutes to flush writes before running COUNT queries
 
 ```bash
 docker exec -it broker kafka-topics --create \
