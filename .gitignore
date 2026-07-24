@@ -1,7 +1,15 @@
 cat > .gitignore << 'EOF'
 venv/
+.venv/
 .env
 __pycache__/
 *.pyc
+.pytest_cache/
+checkpoints/
+logs/
 .DS_Store
 EOF
+
+cat .gitignore
+git check-ignore -v .env        
+git status --short

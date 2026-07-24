@@ -1,3 +1,1 @@
-kafka-python
-cassandra-driver
-spark
+cassandra-driver==3.29.1
