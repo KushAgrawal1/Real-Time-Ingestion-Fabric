@@ -204,6 +204,25 @@ Fixing this needs a separate pre-dedup counting query.
 
 ---
 
+## Testing
+
+`spark/tests/test_validation.py` covers `error_type_column`, the function that
+classifies every record as clean or routes it to quarantine with a reason.
+One test per rule, plus a few on rule precedence - when a record breaks more
+than one rule, the earliest rule in the chain should be the one reported.
+
+```bash
+pip install -r spark/tests/requirements-test.txt
+cd spark && python -m pytest tests/ -v
+```
+
+Needs a JVM (pyspark spins up a local Spark session). If pytest and pyspark
+run under a different Python than the one Spark spawns workers with, you will
+hit `PYTHON_VERSION_MISMATCH` - pin both with `PYSPARK_PYTHON` and
+`PYSPARK_DRIVER_PYTHON` pointing at the same interpreter you installed into.
+
+---
+
 ## Stack
 
 Kafka 7.4 (Confluent), Spark 3.5 Structured Streaming, Cassandra 4.1,
@@ -213,7 +232,8 @@ Airflow 2.6, Docker Compose, Python 3.11.
 
 - Avro schemas on Schema Registry (currently JSON; the registry runs but is
   unused)
-- Unit tests on the validation rules, and CI
+- CI to run the validation unit tests on every push (they currently only run
+  locally)
 - A serving layer over the gold table
 - Backfilling `compass_direction` on rows written before that column existed,
   by replaying bronze
