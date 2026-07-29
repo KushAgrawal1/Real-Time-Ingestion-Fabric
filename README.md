@@ -32,7 +32,7 @@ polling, spanning two ingest hours.
 | Records ingested to bronze | 526,214 |
 | Passing validation | 511,397 |
 | Written to silver after dedup | 286,113 |
-| Duplicates removed at silver | 44.0% |
+| Duplicates removed at silver | 44% |
 | Records quarantined | 2.8% |
 | Distinct validation failures | 1 (`placeholder_vehicle_id`) |
 | Requests to TfL per minute | 2 |
@@ -45,24 +45,28 @@ dropped as duplicates of a record already seen inside the watermark window.
 
 Every quarantined record in every hour measured so far has the same cause: TfL
 emits `vehicleId: "000"` for trains it cannot identify. But the rate at which
-it does so varies by a factor of three depending on when you look.
+it does so varies by nearly a factor of four depending on when you look.
 
-| Ingest hour | Bronze | Quarantined | Rate |
-| --- | ---: | ---: | ---: |
-| `2026-07-24T19` | 413,445 | 8,846 | 2.14% |
-| `2026-07-24T20` | 112,769 | 5,971 | 5.29% |
-| `2026-07-29T15` | 39,614 | 735 | 1.86% |
-| `2026-07-29T16` | 25,096 | 453 | 1.81% |
-
-The 20:00 and 16:00 hours are partial - the run ended partway through one and
-was still in progress during the other - but the rate is a ratio within the
-hour, so partial coverage does not distort it.
+| Ingest hour | Bronze | Quarantined | Rate | Coverage |
+| --- | ---: | ---: | ---: | --- |
+| `2026-07-24T19` | 413,445 | 8,846 | 2.14% | full hour |
+| `2026-07-24T20` | 112,769 | 5,971 | 5.29% | partial, run ended |
+| `2026-07-29T15` | 39,614 | 735 | 1.86% | partial, ~6 min |
+| `2026-07-29T16` | 109,355 | 1,569 | 1.43% | partial, still open |
 
 The evening hour is the outlier, and the plausible explanation is operational
 rather than technical: more stock runs unallocated outside peak, so more
 predictions carry a placeholder vehicle ID. That matters for the quality gate,
 because 5.29% is above the DAG's 5% threshold. A single quiet hour can trip an
 alert that says nothing about pipeline health.
+
+**Treat the partial hours with suspicion.** A full hour at 30-second polling is
+roughly 400,000 records, so only `T19` is complete and the rest are fragments.
+The rate is a ratio within the hour and in principle should not care about
+coverage, but in practice small samples move: `2026-07-29T16` read 1.81% at
+25,096 records and 1.43% at 109,355 records, the same hour measured twice. The
+1.4% end of the range is the weakest number in this table. The one figure worth
+leaning on is `T19`.
 
 Quarantined records are isolated rather than dropped, because the deduplication
 key is `(vehicle_id, naptan_id, expected_arrival)` and dozens of unrelated
@@ -298,6 +302,8 @@ Airflow 2.6, Docker Compose, Python 3.11.
 - The quality gate denominator fix described above
 - Direction normalisation is untested, despite being a documented design
   decision
+- A second complete ingest hour, so the quarantine range rests on more than one
+  full sample
 - Avro schemas on Schema Registry (currently JSON; the registry runs but is
   unused)
 - CI to run the validation unit tests on every push (they currently only run
