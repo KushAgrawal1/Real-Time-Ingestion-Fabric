@@ -37,9 +37,13 @@ def summarise_quarantine(**context):
     counts = {}
     for hour in range(24):
         ingest_hour = f"{ds}T{hour:02d}"
+        # ingest_hour is the full partition key and error_type is the first
+        # clustering column, so this restricts to a single partition and
+        # groups on a clustering prefix. ALLOW FILTERING was left over from
+        # the original schema, where error_type sat in the partition key.
         rows = session.execute(
             "SELECT error_type, COUNT(*) AS n FROM quarantine_arrivals "
-            "WHERE ingest_hour = %s GROUP BY error_type ALLOW FILTERING",
+            "WHERE ingest_hour = %s GROUP BY error_type",
             (ingest_hour,),
         )
         for row in rows:
