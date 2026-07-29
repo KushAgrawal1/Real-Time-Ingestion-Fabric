@@ -28,8 +28,9 @@ HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 # Politeness delay between per-line requests when batching is unavailable.
 PER_LINE_DELAY = float(os.getenv("PER_LINE_DELAY", "0.2"))
 
-# Used only if /Line/Mode/{modes} discovery fails. Hardcoding the full list as
-# the primary source would mean silently missing any new line TfL adds.
+# Used only if /Line/Mode/tube discovery fails. Hardcoding the full list as
+# the primary source would mean silently missing any new line TfL adds. This
+# list is tube-specific and must not be used for any other mode.
 FALLBACK_TUBE_LINES = [
     "bakerloo", "central", "circle", "district", "hammersmith-city",
     "jubilee", "metropolitan", "northern", "piccadilly", "victoria",
@@ -102,7 +103,12 @@ def _get_json(session: requests.Session, path: str):
 # Startup discovery
 # --------------------------------------------------------------------------
 def discover_line_ids(session: requests.Session) -> list:
-    """Ask TfL which lines exist for the configured modes."""
+    """Ask TfL which lines exist for the configured modes.
+
+    The fallback list is tube-only, so it is a valid answer only when tube is
+    the sole configured mode. For anything else, returning it would poll the
+    wrong lines while appearing healthy - better to fail at startup.
+    """
     try:
         payload = _get_json(session, f"/Line/Mode/{TFL_MODES}")
         ids = [line["id"] for line in payload if isinstance(line, dict) and line.get("id")]
@@ -111,8 +117,13 @@ def discover_line_ids(session: requests.Session) -> list:
             return ids
         raise ValueError("discovery returned no line IDs")
     except Exception as exc:
-        log.warning("line discovery failed (%s), using fallback list", exc)
-        return list(FALLBACK_TUBE_LINES)
+        if TFL_MODES.strip().lower() == "tube":
+            log.warning("line discovery failed (%s), using tube fallback list", exc)
+            return list(FALLBACK_TUBE_LINES)
+        raise RuntimeError(
+            f"line discovery failed for mode(s) '{TFL_MODES}' and no fallback "
+            f"list exists for them: {exc}"
+        ) from exc
 
 
 def probe_batching(session: requests.Session, line_ids: list) -> bool:
