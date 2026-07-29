@@ -92,13 +92,20 @@ def main() -> int:
     gold = aggregate(read_clean(spark))
 
     def sink(batch_df, batch_id):
-        if batch_df.rdd.isEmpty():
-            return
-        write_cassandra(
-            batch_df.withColumn("computed_at", F.current_timestamp()),
-            "gold_line_health",
-        )
-
+        # The emptiness check forces evaluation of the whole aggregation.
+        # Without persist, write_cassandra then recomputes it from scratch -
+        # two full passes over every micro-batch. Same pattern as the silver
+        # sink in bronze_silver.py.
+        batch_df.persist()
+        try:
+            if batch_df.isEmpty():
+                return
+            write_cassandra(
+                batch_df.withColumn("computed_at", F.current_timestamp()),
+                "gold_line_health",
+            )
+        finally:
+            batch_df.unpersist()
     query = (
         gold.writeStream
         .foreachBatch(sink)
