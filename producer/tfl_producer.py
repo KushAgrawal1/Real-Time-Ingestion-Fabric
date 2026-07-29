@@ -166,20 +166,49 @@ def fetch_per_line(session: requests.Session, line_ids: list) -> list:
 
 
 def publish(producer: KafkaProducer, records: list) -> tuple:
-    sent = failed = 0
+    """Enqueue records and wait for delivery.
+
+    send() is asynchronous - it returns a future and only raises locally when
+    the buffer is full. Broker-side failures surface through the errback after
+    the configured retries are exhausted, so counting send() calls counts
+    enqueues, not deliveries. These callbacks all run on the producer's single
+    sender thread and are read here only after flush(), so the counters need
+    no locking.
+    """
+    stats = {"delivered": 0, "failed": 0}
+    first_errors = []
+
+    def _on_success(_metadata):
+        stats["delivered"] += 1
+
+    def _on_failure(exc):
+        stats["failed"] += 1
+        # A broker outage fails every record in the poll. Log a handful with
+        # detail and let the count carry the rest.
+        if len(first_errors) < 3:
+            first_errors.append(exc)
+            log.error("delivery failed: %s", exc)
+
     for record in records:
         # lineId is the natural partition key. Fall back to "unknown" rather
         # than None so malformed records still reach bronze and get quarantined
         # downstream instead of being silently dropped here.
-        key = record.get("lineId") or "unknown" if isinstance(record, dict) else "unknown"
+        key = (record.get("lineId") or "unknown") if isinstance(record, dict) else "unknown"
         try:
-            producer.send(RAW_TOPIC, key=key, value=record)
-            sent += 1
+            (producer.send(RAW_TOPIC, key=key, value=record)
+                     .add_callback(_on_success)
+                     .add_errback(_on_failure))
         except KafkaError as exc:
-            failed += 1
-            log.error("send failed: %s", exc)
+            stats["failed"] += 1
+            log.error("enqueue failed: %s", exc)
+
     producer.flush(timeout=30)
-    return sent, failed
+
+    if stats["failed"] > len(first_errors):
+        log.error("%s further delivery failures suppressed",
+                  stats["failed"] - len(first_errors))
+
+    return stats["delivered"], stats["failed"]
 
 
 def main() -> int:
