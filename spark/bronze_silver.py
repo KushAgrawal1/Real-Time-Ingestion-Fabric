@@ -6,7 +6,6 @@ from pyspark.sql import functions as F
 
 from common import (
     CHECKPOINT_ROOT,
-    CLEAN_SCHEMA,  # noqa: F401  (imported for symmetry / docs)
     CLEAN_TOPIC,
     KAFKA_BOOTSTRAP,
     KEYSPACE,
