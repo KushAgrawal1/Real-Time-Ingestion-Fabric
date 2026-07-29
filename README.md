@@ -5,7 +5,7 @@ the TfL Unified API into Kafka, processes it through bronze, silver and gold
 layers with Spark Structured Streaming, and serves per-line service health from
 Cassandra.
 
-The interesting part is not the stack. It is that **45% of everything ingested
+The interesting part is not the stack. It is that **44% of everything ingested
 is a duplicate**, and finding that out is what the pipeline is for.
 
 ---
@@ -13,9 +13,9 @@ is a duplicate**, and finding that out is what the pipeline is for.
 ## The problem
 
 TfL publishes arrival predictions per line. Poll `/Line/{ids}/Arrivals` twice a
-minute and you get roughly 4,200 records each time - but the same train, at the
-same station, with the same predicted arrival, appears in poll after poll. The
-API sits behind a CDN with a cache lifetime close to the poll interval, so
+minute and you get several thousand records each time - but the same train, at
+the same station, with the same predicted arrival, appears in poll after poll.
+The API sits behind a CDN with a cache lifetime close to the poll interval, so
 consecutive requests frequently return byte-identical payloads.
 
 Naive ingestion writes all of it. The table grows linearly with polling
@@ -24,22 +24,49 @@ wrong by whatever factor you happened to poll at.
 
 ## Measured results
 
-Figures from a single continuous run, 11 tube lines, 30-second polling.
+Figures from a continuous run on 24 July 2026, 11 tube lines, 30-second
+polling, spanning two ingest hours.
 
 | Metric | Value |
 | --- | ---: |
-| Records ingested to bronze | 60,972 |
-| Duplicates removed at silver | ~45% |
-| Records quarantined | 0.37% |
+| Records ingested to bronze | 526,214 |
+| Passing validation | 511,397 |
+| Written to silver after dedup | 286,113 |
+| Duplicates removed at silver | 44.0% |
+| Records quarantined | 2.8% |
 | Distinct validation failures | 1 (`placeholder_vehicle_id`) |
-| Records per poll | ~4,205 |
 | Requests to TfL per minute | 2 |
 
-The quarantine rate is low because the feed is clean apart from one known
-quirk: TfL emits `vehicleId: "000"` for trains it cannot identify. Those
-records are isolated rather than dropped, because the deduplication key is
-`(vehicle_id, naptan_id, expected_arrival)` and dozens of unrelated trains
-sharing a placeholder ID would collapse into one another.
+The duplicate figure is the one the project exists to produce, and it is
+reproducible: 225,284 of the 511,397 records that passed validation were
+dropped as duplicates of a record already seen inside the watermark window.
+
+### The quarantine rate is not a constant
+
+Every quarantined record in every hour measured so far has the same cause: TfL
+emits `vehicleId: "000"` for trains it cannot identify. But the rate at which
+it does so varies by a factor of three depending on when you look.
+
+| Ingest hour | Bronze | Quarantined | Rate |
+| --- | ---: | ---: | ---: |
+| `2026-07-24T19` | 413,445 | 8,846 | 2.14% |
+| `2026-07-24T20` | 112,769 | 5,971 | 5.29% |
+| `2026-07-29T15` | 39,614 | 735 | 1.86% |
+| `2026-07-29T16` | 25,096 | 453 | 1.81% |
+
+The 20:00 and 16:00 hours are partial - the run ended partway through one and
+was still in progress during the other - but the rate is a ratio within the
+hour, so partial coverage does not distort it.
+
+The evening hour is the outlier, and the plausible explanation is operational
+rather than technical: more stock runs unallocated outside peak, so more
+predictions carry a placeholder vehicle ID. That matters for the quality gate,
+because 5.29% is above the DAG's 5% threshold. A single quiet hour can trip an
+alert that says nothing about pipeline health.
+
+Quarantined records are isolated rather than dropped, because the deduplication
+key is `(vehicle_id, naptan_id, expected_arrival)` and dozens of unrelated
+trains sharing a placeholder ID would collapse into one another.
 
 ---
 
@@ -131,6 +158,12 @@ partial partition-key restriction that Cassandra cannot route, so it demanded
 `ALLOW FILTERING`. In Cassandra you model for the query, and a query you did not
 plan for is often awkward or impossible.
 
+Note the asymmetry this creates when comparing layers. Counting an hour of
+quarantine is a single-partition read; counting the same hour of bronze needs
+`kafka_partition IN (0,1,2,3,4,5)` because the partition key is compound. That
+is the cost of spreading bronze writes across six partitions, and it is worth
+paying - bronze is the highest-volume table in the keyspace.
+
 **Gold writes in update mode.** Append mode only emits a window once the
 watermark passes it, so the served data would always be one watermark stale.
 Update mode re-emits a window whenever it changes, and because a Cassandra
@@ -153,6 +186,10 @@ docker compose up -d zookeeper broker kafka-init tfl-producer spark-stream
 docker compose up -d spark-gold
 ```
 
+The producer is built from `./producer`, so changes to it need
+`docker compose up -d --build tfl-producer`. The Spark jobs are bind-mounted
+from `./spark`, so they pick up changes on restart with no rebuild.
+
 Optional services sit behind profiles so they do not start by default:
 
 ```bash
@@ -168,14 +205,24 @@ docker compose --profile registry up -d      # Schema Registry
 SELECT * FROM tfl.silver_arrivals
   WHERE line_id='victoria' AND arrival_date='2026-07-24' LIMIT 10;
 
--- what did not, and why
+-- what did not, and why. Single partition, no ALLOW FILTERING needed.
 SELECT error_type, COUNT(*) FROM tfl.quarantine_arrivals
-  WHERE ingest_hour='2026-07-24T18' GROUP BY error_type;
+  WHERE ingest_hour='2026-07-24T19' GROUP BY error_type;
+
+-- the denominator for that rate, across all six Kafka partitions
+SELECT COUNT(*) FROM tfl.bronze_arrivals
+  WHERE ingest_hour='2026-07-24T19' AND kafka_partition IN (0,1,2,3,4,5);
 
 -- service health per line
 SELECT line_id, window_start, active_vehicles, avg_time_to_station
   FROM tfl.gold_line_health WHERE line_id='victoria' LIMIT 5;
 ```
+
+Bronze and quarantine rows are keyed on Kafka coordinates, so a second run
+appends new rows. Silver is keyed on a business key, so re-ingesting the same
+predictions upserts in place. Comparing a bare `COUNT(*)` on bronze against one
+on silver across multiple runs therefore overstates the duplicate rate - scope
+both to a single run, as the figures above are.
 
 ---
 
@@ -196,11 +243,29 @@ numbered migration files.
 support downgrades - booting 4.1 against a data directory written by 5.0 fails
 on commitlog replay and the node refuses to start.
 
-**Known limitation.** `pipeline_metrics` records row counts inside
-`foreachBatch`, which runs after deduplication, so `rows_in` and `rows_out` are
-both post-dedup and the duplicate count reads as zero. The duplicate figure in
-this README comes from comparing bronze, silver and quarantine counts directly.
-Fixing this needs a separate pre-dedup counting query.
+**Known limitation: metrics are counted post-dedup.** `pipeline_metrics`
+records row counts inside `foreachBatch`, which runs after deduplication, so
+`rows_in` and `rows_out` are both post-dedup and the duplicate count reads as
+zero. Fixing this needs a separate pre-dedup counting query. Every duplicate
+figure in this README is derived by comparing bronze, silver and quarantine
+counts directly rather than from `pipeline_metrics`.
+
+**Known limitation: the quality gate inherits that error.** The Airflow DAG
+computes `quarantined / (quarantined + rows_in)`, and because `rows_in` is
+post-dedup, the denominator is missing every duplicate that was removed. The
+reported rate is inflated by roughly the dedup factor.
+
+On 24 July the gate would have computed 14,817 / 300,930 = **4.92%** against a
+true rate of 14,817 / 526,214 = **2.82%** - a 1.75x overstatement, landing
+0.08 percentage points under the 5% threshold. The gate did not fire, and it
+did not fire by luck. A slightly quieter day, or an evening-weighted run at the
+5.29% hourly rate seen above, and it would raise an alert for a day that was
+entirely healthy.
+
+The correct denominator is the bronze count for the same period. Bronze is
+partitioned on `(ingest_hour, kafka_partition)` and the DAG already loops over
+all 24 hours, so it can be summed in the same pass with an
+`IN (0,1,2,3,4,5)` restriction.
 
 ---
 
@@ -230,6 +295,9 @@ Airflow 2.6, Docker Compose, Python 3.11.
 
 ## Not yet done
 
+- The quality gate denominator fix described above
+- Direction normalisation is untested, despite being a documented design
+  decision
 - Avro schemas on Schema Registry (currently JSON; the registry runs but is
   unused)
 - CI to run the validation unit tests on every push (they currently only run
