@@ -8,10 +8,17 @@ from airflow import DAG
 from airflow.exceptions import AirflowFailException
 from airflow.operators.python import PythonOperator
 
+from quality_checks import (
+    fetch_bronze_volume,
+    fetch_quarantine_counts,
+    fetch_throughput_stats,
+    quarantine_rate,
+)
+
 CASSANDRA_HOST = os.getenv("CASSANDRA_HOST", "cassandra")
 KEYSPACE = "tfl"
 
-# Trip the alarm if more than 5% of records were quarantined.
+# Trip the alarm if more than 5% of everything ingested was quarantined.
 QUARANTINE_RATE_THRESHOLD = 0.05
 
 default_args = {
@@ -32,23 +39,7 @@ def _session():
 def summarise_quarantine(**context):
     """Break yesterday's quarantined records down by reason."""
     ds = context["ds"]
-    session = _session()
-
-    counts = {}
-    for hour in range(24):
-        ingest_hour = f"{ds}T{hour:02d}"
-        # ingest_hour is the full partition key and error_type is the first
-        # clustering column, so this restricts to a single partition and
-        # groups on a clustering prefix. ALLOW FILTERING was left over from
-        # the original schema, where error_type sat in the partition key.
-        rows = session.execute(
-            "SELECT error_type, COUNT(*) AS n FROM quarantine_arrivals "
-            "WHERE ingest_hour = %s GROUP BY error_type",
-            (ingest_hour,),
-        )
-        for row in rows:
-            counts[row.error_type] = counts.get(row.error_type, 0) + row.n
-
+    counts = fetch_quarantine_counts(_session(), ds)
     total = sum(counts.values())
     log.info("quarantined on %s: %s (total %s)", ds, counts, total)
     context["ti"].xcom_push(key="quarantine_by_type", value=counts)
@@ -56,47 +47,48 @@ def summarise_quarantine(**context):
     return counts
 
 
-def summarise_throughput(**context):
-    """Total rows in and out of the silver job for the day."""
+def summarise_bronze_volume(**context):
+    """Total records ingested to bronze for the day - the correct
+    denominator for the quarantine rate, since it is counted before
+    deduplication runs. See quarantine_rate()'s docstring."""
     ds = context["ds"]
-    session = _session()
+    total = fetch_bronze_volume(_session(), ds)
+    log.info("bronze volume on %s: %s", ds, total)
+    context["ti"].xcom_push(key="bronze_total", value=total)
+    return total
 
-    rows = session.execute(
-        "SELECT rows_in, rows_out, duration_ms FROM pipeline_metrics "
-        "WHERE job_name = %s AND metric_date = %s",
-        ("silver", datetime.strptime(ds, "%Y-%m-%d").date()),
-    )
 
-    batches = rows_in = rows_out = duration = 0
-    for row in rows:
-        batches += 1
-        rows_in += row.rows_in or 0
-        rows_out += row.rows_out or 0
-        duration += row.duration_ms or 0
+def summarise_throughput(**context):
+    """Silver job batch stats, for latency/volume observability only.
 
-    avg_batch_ms = round(duration / batches, 1) if batches else 0.0
+    rows_in here is counted inside silver's foreachBatch sink, which runs
+    AFTER dropDuplicatesWithinWatermark - so it is the post-dedup row
+    count, not a true input count. It must not be used as the quality
+    gate's denominator (that was the original bug); use
+    summarise_bronze_volume for that instead.
+    """
+    ds = context["ds"]
+    stats = fetch_throughput_stats(_session(), ds)
     log.info(
-        "throughput on %s: batches=%s rows_in=%s rows_out=%s avg_batch_ms=%s",
-        ds, batches, rows_in, rows_out, avg_batch_ms,
+        "throughput on %s: batches=%s rows_in(post-dedup)=%s avg_batch_ms=%s",
+        ds, stats["batches"], stats["rows_in"], stats["avg_batch_ms"],
     )
-    context["ti"].xcom_push(key="rows_in", value=rows_in)
-    return {"batches": batches, "rows_in": rows_in, "avg_batch_ms": avg_batch_ms}
+    return stats
 
 
 def enforce_quality_gate(**context):
     """Fail loudly if the quarantine rate crossed the threshold."""
     ti = context["ti"]
     quarantined = ti.xcom_pull(task_ids="summarise_quarantine", key="quarantine_total") or 0
-    processed = ti.xcom_pull(task_ids="summarise_throughput", key="rows_in") or 0
+    bronze_total = ti.xcom_pull(task_ids="summarise_bronze_volume", key="bronze_total") or 0
 
-    total = quarantined + processed
-    if total == 0:
-        log.warning("no records at all for %s - the producer may have been down",
+    if bronze_total == 0:
+        log.warning("no bronze records at all for %s - the producer may have been down",
                     context["ds"])
         return
 
-    rate = quarantined / total
-    log.info("quarantine rate: %.4f (%s of %s)", rate, quarantined, total)
+    rate = quarantine_rate(quarantined, bronze_total)
+    log.info("quarantine rate: %.4f (%s of %s)", rate, quarantined, bronze_total)
 
     if rate > QUARANTINE_RATE_THRESHOLD:
         raise AirflowFailException(
@@ -121,6 +113,11 @@ with DAG(
         python_callable=summarise_quarantine,
     )
 
+    t_bronze_volume = PythonOperator(
+        task_id="summarise_bronze_volume",
+        python_callable=summarise_bronze_volume,
+    )
+
     t_throughput = PythonOperator(
         task_id="summarise_throughput",
         python_callable=summarise_throughput,
@@ -131,4 +128,4 @@ with DAG(
         python_callable=enforce_quality_gate,
     )
 
-    [t_quarantine, t_throughput] >> t_gate
+    [t_quarantine, t_bronze_volume, t_throughput] >> t_gate
