@@ -1,5 +1,7 @@
 # Real-Time Ingestion Fabric
 
+[![CI](https://github.com/KushAgrawal1/Real-Time-Ingestion-Fabric/actions/workflows/ci.yml/badge.svg)](https://github.com/KushAgrawal1/Real-Time-Ingestion-Fabric/actions/workflows/ci.yml)
+
 A streaming pipeline over live London Underground arrival predictions. Ingests
 the TfL Unified API into Kafka, processes it through bronze, silver and gold
 layers with Spark Structured Streaming, and serves per-line service health from
@@ -271,6 +273,15 @@ partitioned on `(ingest_hour, kafka_partition)` and the DAG already loops over
 all 24 hours, so it can be summed in the same pass with an
 `IN (0,1,2,3,4,5)` restriction.
 
+**Fixed.** The gate now sums bronze volume across the day (`kafka_partition IN
+(0,1,2,3,4,5)`, 24 single-hour queries) and uses that as the denominator
+instead of the silver job's post-dedup `rows_in`. The quarantine-rate
+computation is factored into `dags/quality_checks.py`, which has no Airflow
+import, so `dags/tests/test_quality_checks.py` pins the exact numbers above -
+14,817 quarantined against a bronze total of 526,214 is 2.82%, not the 4.92%
+the old formula would have reported - as a regression test, with a fake
+Cassandra session standing in for the cluster.
+
 ---
 
 ## Testing
@@ -290,6 +301,16 @@ run under a different Python than the one Spark spawns workers with, you will
 hit `PYTHON_VERSION_MISMATCH` - pin both with `PYSPARK_PYTHON` and
 `PYSPARK_DRIVER_PYTHON` pointing at the same interpreter you installed into.
 
+`dags/tests/test_quality_checks.py` covers the quarantine-rate math and the
+Cassandra query shape in `dags/quality_checks.py`, using a fake session - no
+Airflow install, no JVM, no cluster:
+
+```bash
+cd dags && python -m pytest tests/ -v
+```
+
+Both suites run in CI on every push and pull request.
+
 ---
 
 ## Stack
@@ -299,15 +320,12 @@ Airflow 2.6, Docker Compose, Python 3.11.
 
 ## Not yet done
 
-- The quality gate denominator fix described above
 - Direction normalisation is untested, despite being a documented design
   decision
 - A second complete ingest hour, so the quarantine range rests on more than one
   full sample
 - Avro schemas on Schema Registry (currently JSON; the registry runs but is
   unused)
-- CI to run the validation unit tests on every push (they currently only run
-  locally)
 - A serving layer over the gold table
 - Backfilling `compass_direction` on rows written before that column existed,
   by replaying bronze
